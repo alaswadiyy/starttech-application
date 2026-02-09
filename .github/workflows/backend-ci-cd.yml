@@ -1,0 +1,175 @@
+name: Backend CI/CD Pipeline
+
+permissions:
+  security-events: write
+  contents: read
+
+on:
+  push:
+    branches: [main, stagging]
+    paths:
+      - 'Server/**'
+      - '.github/workflows/backend-ci-cd.yml'
+  pull_request:
+    branches: [main]
+    paths: ['Server/**']
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.25.1"
+  GOTOOLCHAIN: auto
+  ECR_REPOSITORY: starttech-ecr
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # Test application
+  test-and-scan:
+    name: Test, Lint & Scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./Server/MuchToDo
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: Server/MuchToDo/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run unit tests
+        run: go test ./... -short -race -covermode=atomic -coverprofile=coverage.out
+
+      - name: Run integration tests
+        run: go test ./... -tags=integration -race
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@0.15.0
+        with:
+          scan-type: fs
+          scan-ref: Server/MuchToDo
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: Server/MuchToDo/coverage.out
+
+
+  # Build application
+  build:
+    needs: test-and-scan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./Server/MuchToDo
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          docker build --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Scan Docker image from ECR
+        id: trivy-scan
+        run: |
+          # Install trivy v0.68.2
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.68.2
+          
+          # Run scan with SARIF output
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-results.sarif \
+            --exit-code 1 \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          
+          echo "Trivy scan completed with exit code: $?"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: Server/MuchToDo/trivy-results.sarif
+
+
+  # Deploy application
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy to EC2 via AWS SSM
+        run: |
+          IFS=',' read -ra IDS <<< "${{ secrets.ASG_SERVER_IDS }}"
+
+          for INSTANCE_ID in "${IDS[@]}"; do
+            echo "Deploying to $INSTANCE_ID..."
+
+            aws ssm send-command --no-cli-pager --region "${{ vars.AWS_REGION }}" --document-name "AWS-RunShellScript" \
+              --targets "Key=instanceids,Values=$INSTANCE_ID" \
+              --comment "Deploy backend container via GitHub Actions" \
+              --parameters commands="[
+                \"set -euo pipefail\",
+                \"echo '${{ vars.APP_ENV_FILE }}' | sudo tee /app/.env\",
+                \"aws ecr get-login-password --region ${{ vars.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com\",
+                \"sudo docker pull ${{ secrets.ECR_REPO_URL }}:${{ env.IMAGE_TAG }}\",
+                \"sudo systemctl stop nginx 2>/dev/null || true\",
+                \"sudo systemctl disable nginx 2>/dev/null || true\",
+                \"sudo docker rm -f backend || true\",
+                \"sudo docker run -d --name backend --restart always -p 80:8080 -v /app/.env:/app/.env \
+                  -v /app/application.log:/app/application.log ${{ secrets.ECR_REPO_URL }}:${{ env.IMAGE_TAG }}\",
+                \"sleep 2\",
+                \"sudo docker inspect --format='{{.State.Running}}' backend\",
+                \"sudo docker logs --tail 10 backend 2>/dev/null || echo 'No logs yet'\"
+              ]" \
+              --output text
+          done

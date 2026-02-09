@@ -1,0 +1,140 @@
+name: Frontend CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, stagging]
+    paths:
+      - 'Client/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+  pull_request:
+    branches: [main]
+    paths: ['Client/**']
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: starttech-frontend-bkt
+
+jobs:
+  # Test pipeline
+  test-and-scan:
+    name: Test, Lint & Scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./Client
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+      # - name: Run unit tests
+      #   run: npm test -- --coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          directory: ./Client/coverage
+
+      - name: Security audit
+        run: |
+          npm audit fix
+          npm audit --audit-level=high
+
+      - name: Run OWASP dependency check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'starttech-frontend'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --scan ./Client
+            --out ./reports
+
+
+  # Build pipeline
+  build:
+    needs: test-and-scan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./Client
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.x'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ secrets.LOAD_BALANCER_DNS_NAME }}
+          
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: Client/dist
+
+
+  # Deploy pipeline
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: dist
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync ./dist s3://${{ env.S3_BUCKET }} --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "*.html" --exclude "*.json" --exclude "*.xml"
+
+          aws s3 sync ./dist s3://${{ env.S3_BUCKET }} --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html" --include "*.json" --include "*.xml"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
